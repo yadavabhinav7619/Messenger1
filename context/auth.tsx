@@ -11,6 +11,8 @@ interface Profile {
   created_at: string;
   is_online: boolean;
   last_seen: string;
+  push_token: string | null;
+  notifications_enabled: boolean;
 }
 
 interface AuthContextType {
@@ -18,9 +20,11 @@ interface AuthContextType {
   user: User | null;
   profile: Profile | null;
   loading: boolean;
+  isAdmin: boolean;
   signIn: (username: string, password: string) => Promise<{ error: string | null }>;
   signUp: (username: string, password: string, displayName: string) => Promise<{ error: string | null }>;
   signOut: () => Promise<void>;
+  updatePushToken: (token: string) => Promise<void>;
 }
 
 const AuthContext = createContext<AuthContextType | undefined>(undefined);
@@ -30,6 +34,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [user, setUser] = useState<User | null>(null);
   const [profile, setProfile] = useState<Profile | null>(null);
   const [loading, setLoading] = useState(true);
+
+  const isAdmin = profile?.role === 'admin';
 
   async function fetchProfile(userId: string) {
     const { data } = await supabase
@@ -87,14 +93,25 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     if (user) {
       await supabase
         .from('profiles')
-        .update({ is_online: false, last_seen: new Date().toISOString() })
+        .update({ is_online: false, last_seen: new Date().toISOString(), push_token: null })
         .eq('id', user.id);
     }
     await supabase.auth.signOut();
   }
 
+  async function updatePushToken(token: string) {
+    if (!user) return;
+    await supabase
+      .from('profiles')
+      .update({ push_token: token })
+      .eq('id', user.id);
+    if (profile) {
+      setProfile({ ...profile, push_token: token });
+    }
+  }
+
   return (
-    <AuthContext.Provider value={{ session, user, profile, loading, signIn, signUp, signOut }}>
+    <AuthContext.Provider value={{ session, user, profile, loading, isAdmin, signIn, signUp, signOut, updatePushToken }}>
       {children}
     </AuthContext.Provider>
   );

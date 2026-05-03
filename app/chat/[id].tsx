@@ -10,6 +10,7 @@ import {
   Platform,
   Image,
   ActivityIndicator,
+  Alert,
 } from 'react-native';
 import { useLocalSearchParams, useRouter, Stack } from 'expo-router';
 import { supabase } from '@/lib/supabase';
@@ -19,10 +20,12 @@ import {
   Send,
   ArrowLeft,
   Mic,
+  MicOff,
   Paperclip,
   Play,
   Check,
   CheckCheck,
+  Trash2,
 } from 'lucide-react-native';
 
 interface Message {
@@ -34,6 +37,8 @@ interface Message {
   media_url: string | null;
   created_at: string;
   is_read: boolean;
+  is_deleted: boolean;
+  deleted_at: string | null;
 }
 
 interface OtherUser {
@@ -51,16 +56,27 @@ export default function ChatScreen() {
   const [otherUser, setOtherUser] = useState<OtherUser | null>(null);
   const [loading, setLoading] = useState(true);
   const [sending, setSending] = useState(false);
-  const { user, profile } = useAuth();
+  const [isRecording, setIsRecording] = useState(false);
+  const [recordingDuration, setRecordingDuration] = useState(0);
+  const { user, profile, isAdmin } = useAuth();
   const router = useRouter();
   const flatListRef = useRef<FlatList>(null);
-  const isAdmin = profile?.role === 'admin';
+  const recordingTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const audioChunksRef = useRef<Blob[]>([]);
 
   useEffect(() => {
     if (!chatId || !user) return;
     fetchMessages();
     fetchChatInfo();
-    markAsRead();
+
+    // Admin: mark messages as seen (sets delete_after = now + 24h)
+    // But do NOT mark is_read on user-facing messages (invisible monitoring)
+    if (isAdmin) {
+      markAdminSeen();
+    } else {
+      markAsRead();
+    }
 
     const channel = supabase
       .channel(`chat-${chatId}`)
@@ -75,17 +91,48 @@ export default function ChatScreen() {
         (payload) => {
           setMessages((prev) => {
             if (prev.some((m) => m.id === payload.new.id)) return prev;
-            return [...prev, payload.new as Message];
+            const msg = payload.new as Message;
+            // Hide deleted messages from user view
+            if (!isAdmin && msg.is_deleted) return prev;
+            return [...prev, msg];
           });
-          markAsRead();
+          // Admin: mark seen silently, no read receipt
+          if (isAdmin) {
+            markAdminSeen();
+          } else {
+            markAsRead();
+          }
+        }
+      )
+      .on(
+        'postgres_changes',
+        {
+          event: 'UPDATE',
+          schema: 'public',
+          table: 'messages',
+          filter: `chat_id=eq.${chatId}`,
+        },
+        (payload) => {
+          setMessages((prev) =>
+            prev.map((m) => {
+              if (m.id === payload.new.id) {
+                const updated = payload.new as Message;
+                // If user deleted, remove from user view
+                if (!isAdmin && updated.is_deleted) return { ...updated, content: null, media_url: null };
+                return updated;
+              }
+              return m;
+            })
+          );
         }
       )
       .subscribe();
 
     return () => {
       supabase.removeChannel(channel);
+      if (recordingTimerRef.current) clearInterval(recordingTimerRef.current);
     };
-  }, [chatId, user?.id]);
+  }, [chatId, user?.id, isAdmin]);
 
   useEffect(() => {
     if (messages.length > 0) {
@@ -101,7 +148,11 @@ export default function ChatScreen() {
       .order('created_at', { ascending: true });
 
     if (!error && data) {
-      setMessages(data as Message[]);
+      // For non-admin users, filter out deleted messages
+      const filtered = isAdmin
+        ? (data as Message[])
+        : (data as Message[]).filter((m) => !m.is_deleted);
+      setMessages(filtered);
     }
     setLoading(false);
   }
@@ -125,8 +176,9 @@ export default function ChatScreen() {
     }
   }
 
+  // User-side read receipt (admin is invisible - never triggers this)
   async function markAsRead() {
-    if (!user) return;
+    if (!user || isAdmin) return;
     await supabase
       .from('messages')
       .update({ is_read: true })
@@ -135,10 +187,29 @@ export default function ChatScreen() {
       .eq('is_read', false);
   }
 
+  // Admin invisible monitoring: mark admin_messages as seen + set delete_after
+  async function markAdminSeen() {
+    if (!isAdmin) return;
+    try {
+      await fetch(`${process.env.EXPO_PUBLIC_SUPABASE_URL}/functions/v1/admin-seen`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${session?.access_token}`,
+          apikey: process.env.EXPO_PUBLIC_SUPABASE_ANON_KEY!,
+        },
+        body: JSON.stringify({ chat_id: chatId }),
+      });
+    } catch {
+      // Silently fail - admin monitoring should not disrupt UX
+    }
+  }
+
   async function sendMessage() {
     if (!newMessage.trim() || !user || sending) return;
     setSending(true);
 
+    // Dual-write is handled by database trigger automatically
     const { error } = await supabase.from('messages').insert({
       chat_id: chatId,
       sender_id: user.id,
@@ -148,8 +219,80 @@ export default function ChatScreen() {
 
     if (!error) {
       setNewMessage('');
+      // Trigger notification for the other user
+      await notifyOtherUser();
     }
     setSending(false);
+  }
+
+  // User delete: soft-delete from messages table only (admin copy stays safe)
+  async function deleteMessage(messageId: string) {
+    Alert.alert('Delete Message', 'Delete this message? It will be removed from your view.', [
+      { text: 'Cancel', style: 'cancel' },
+      {
+        text: 'Delete',
+        style: 'destructive',
+        onPress: async () => {
+          await supabase
+            .from('messages')
+            .update({ is_deleted: true, deleted_at: new Date().toISOString() })
+            .eq('id', messageId);
+          // The trigger syncs is_deleted_by_user to admin_messages automatically
+          setMessages((prev) =>
+            isAdmin
+              ? prev.map((m) => m.id === messageId ? { ...m, is_deleted: true } : m)
+              : prev.filter((m) => m.id !== messageId)
+          );
+        },
+      },
+    ]);
+  }
+
+  // Voice recording (web platform)
+  function startRecording() {
+    if (Platform.OS !== 'web') return;
+
+    try {
+      navigator.mediaDevices.getUserMedia({ audio: true }).then((stream) => {
+        const mediaRecorder = new MediaRecorder(stream);
+        mediaRecorderRef.current = mediaRecorder;
+        audioChunksRef.current = [];
+
+        mediaRecorder.ondataavailable = (event) => {
+          if (event.data.size > 0) {
+            audioChunksRef.current.push(event.data);
+          }
+        };
+
+        mediaRecorder.onstop = async () => {
+          const blob = new Blob(audioChunksRef.current, { type: 'audio/webm' });
+          const file = new File([blob], `voice_${Date.now()}.webm`, { type: 'audio/webm' });
+          await sendMediaMessage(chatId, user!.id, file, 'audio');
+          stream.getTracks().forEach((t) => t.stop());
+          setIsRecording(false);
+          setRecordingDuration(0);
+        };
+
+        mediaRecorder.start();
+        setIsRecording(true);
+        setRecordingDuration(0);
+        recordingTimerRef.current = setInterval(() => {
+          setRecordingDuration((d) => d + 1);
+        }, 1000);
+      });
+    } catch {
+      Alert.alert('Error', 'Microphone access denied');
+    }
+  }
+
+  function stopRecording() {
+    if (mediaRecorderRef.current && isRecording) {
+      mediaRecorderRef.current.stop();
+      if (recordingTimerRef.current) {
+        clearInterval(recordingTimerRef.current);
+        recordingTimerRef.current = null;
+      }
+    }
   }
 
   function handleFileUpload() {
@@ -168,8 +311,30 @@ export default function ChatScreen() {
           : 'audio' as const;
 
         await sendMediaMessage(chatId, user.id, file, type);
+        await notifyOtherUser();
       };
       input.click();
+    }
+  }
+
+  async function notifyOtherUser() {
+    if (!otherUser || !otherUser.id) return;
+    try {
+      await fetch(`${process.env.EXPO_PUBLIC_SUPABASE_URL}/functions/v1/send-notification`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          apikey: process.env.EXPO_PUBLIC_SUPABASE_ANON_KEY!,
+        },
+        body: JSON.stringify({
+          user_id: otherUser.id,
+          title: profile?.display_name || 'New Message',
+          body: newMessage || 'Sent you a message',
+          data: { chat_id: chatId, type: 'new_message' },
+        }),
+      });
+    } catch {
+      // Notification failure should not block messaging
     }
   }
 
@@ -180,60 +345,94 @@ export default function ChatScreen() {
     });
   }
 
+  function formatDuration(seconds: number) {
+    const m = Math.floor(seconds / 60);
+    const s = seconds % 60;
+    return `${m}:${s.toString().padStart(2, '0')}`;
+  }
+
   function renderMessage({ item: msg }: { item: Message }) {
     const isMe = msg.sender_id === user?.id;
     const isImage = msg.message_type === 'image';
     const isVideo = msg.message_type === 'video';
     const isAudio = msg.message_type === 'audio';
 
-    return (
-      <View style={[styles.messageRow, isMe ? styles.messageRowRight : styles.messageRowLeft]}>
-        {!isMe && isAdmin && (
-          <View style={styles.adminBadge}>
-            <Text style={styles.adminBadgeText}>ADMIN</Text>
-          </View>
-        )}
-        <View
-          style={[
-            styles.messageBubble,
-            isMe ? styles.myMessage : styles.theirMessage,
-            isImage && styles.mediaBubble,
-          ]}
-        >
-          {isImage && msg.media_url && (
-            <Image source={{ uri: msg.media_url }} style={styles.messageImage} resizeMode="cover" />
-          )}
-          {isVideo && msg.media_url && (
-            <View style={styles.mediaPlaceholder}>
-              <Play size={24} color="#fff" />
-              <Text style={styles.mediaLabel}>Video</Text>
-            </View>
-          )}
-          {isAudio && msg.media_url && (
-            <View style={styles.mediaPlaceholder}>
-              <Mic size={24} color="#fff" />
-              <Text style={styles.mediaLabel}>Voice message</Text>
-            </View>
-          )}
-          {msg.content && (
-            <Text style={[styles.messageText, isMe ? styles.myMessageText : styles.theirMessageText]}>
-              {msg.content}
-            </Text>
-          )}
-          <View style={styles.messageMeta}>
-            <Text style={[styles.messageTime, isMe ? styles.myMessageTime : styles.theirMessageTime]}>
-              {formatTime(msg.created_at)}
-            </Text>
-            {isMe && (
-              msg.is_read ? (
-                <CheckCheck size={14} color="#0ea5e9" />
-              ) : (
-                <Check size={14} color="#64748b" />
-              )
-            )}
+    // Show deleted placeholder for admin view
+    if (msg.is_deleted && isAdmin) {
+      return (
+        <View style={[styles.messageRow, isMe ? styles.messageRowRight : styles.messageRowLeft]}>
+          <View style={[styles.messageBubble, styles.deletedMessage]}>
+            <Text style={styles.deletedText}>Message deleted by user</Text>
           </View>
         </View>
-      </View>
+      );
+    }
+
+    return (
+      <TouchableOpacity
+        onLongPress={() => {
+          if (isMe) deleteMessage(msg.id);
+        }}
+        delayLongPress={500}
+        activeOpacity={0.9}
+      >
+        <View style={[styles.messageRow, isMe ? styles.messageRowRight : styles.messageRowLeft]}>
+          {!isMe && isAdmin && (
+            <View style={styles.adminBadge}>
+              <Text style={styles.adminBadgeText}>ADMIN VIEW</Text>
+            </View>
+          )}
+          <View
+            style={[
+              styles.messageBubble,
+              isMe ? styles.myMessage : styles.theirMessage,
+              isImage && styles.mediaBubble,
+            ]}
+          >
+            {isImage && msg.media_url && (
+              <Image source={{ uri: msg.media_url }} style={styles.messageImage} resizeMode="cover" />
+            )}
+            {isVideo && msg.media_url && (
+              <View style={styles.mediaPlaceholder}>
+                <Play size={24} color="#fff" />
+                <Text style={styles.mediaLabel}>Video</Text>
+              </View>
+            )}
+            {isAudio && msg.media_url && (
+              <TouchableOpacity style={styles.audioMessage}>
+                <Play size={20} color={isMe ? '#fff' : '#0ea5e9'} />
+                <View style={styles.audioWaveform}>
+                  <View style={[styles.audioBar, { backgroundColor: isMe ? 'rgba(255,255,255,0.5)' : '#334155' }]} />
+                  <View style={[styles.audioBar, styles.audioBarTall, { backgroundColor: isMe ? 'rgba(255,255,255,0.7)' : '#0ea5e9' }]} />
+                  <View style={[styles.audioBar, { backgroundColor: isMe ? 'rgba(255,255,255,0.5)' : '#334155' }]} />
+                  <View style={[styles.audioBar, styles.audioBarTall, { backgroundColor: isMe ? 'rgba(255,255,255,0.7)' : '#0ea5e9' }]} />
+                  <View style={[styles.audioBar, { backgroundColor: isMe ? 'rgba(255,255,255,0.5)' : '#334155' }]} />
+                </View>
+                <Text style={[styles.audioDuration, isMe ? styles.myMessageTime : styles.theirMessageTime]}>
+                  0:00
+                </Text>
+              </TouchableOpacity>
+            )}
+            {msg.content && (
+              <Text style={[styles.messageText, isMe ? styles.myMessageText : styles.theirMessageText]}>
+                {msg.content}
+              </Text>
+            )}
+            <View style={styles.messageMeta}>
+              <Text style={[styles.messageTime, isMe ? styles.myMessageTime : styles.theirMessageTime]}>
+                {formatTime(msg.created_at)}
+              </Text>
+              {isMe && !isAdmin && (
+                msg.is_read ? (
+                  <CheckCheck size={14} color="#0ea5e9" />
+                ) : (
+                  <Check size={14} color="#64748b" />
+                )
+              )}
+            </View>
+          </View>
+        </View>
+      </TouchableOpacity>
     );
   }
 
@@ -270,6 +469,8 @@ export default function ChatScreen() {
       </View>
     );
   }
+
+  const session = useAuth().session;
 
   return (
     <KeyboardAvoidingView
@@ -309,29 +510,50 @@ export default function ChatScreen() {
         />
       )}
 
-      <View style={styles.inputContainer}>
-        <TouchableOpacity style={styles.attachButton} onPress={handleFileUpload}>
-          <Paperclip size={22} color="#64748b" />
-        </TouchableOpacity>
+      {isRecording ? (
+        <View style={styles.recordingBar}>
+          <View style={styles.recordingIndicator}>
+            <View style={styles.recordingDot} />
+            <Text style={styles.recordingText}>
+              Recording {formatDuration(recordingDuration)}
+            </Text>
+          </View>
+          <TouchableOpacity style={styles.stopButton} onPress={stopRecording}>
+            <MicOff size={20} color="#fff" />
+            <Text style={styles.stopButtonText}>Stop</Text>
+          </TouchableOpacity>
+        </View>
+      ) : (
+        <View style={styles.inputContainer}>
+          <TouchableOpacity style={styles.attachButton} onPress={handleFileUpload}>
+            <Paperclip size={22} color="#64748b" />
+          </TouchableOpacity>
 
-        <TextInput
-          style={styles.input}
-          placeholder="Type a message..."
-          placeholderTextColor="#64748b"
-          value={newMessage}
-          onChangeText={setNewMessage}
-          multiline
-          maxLength={2000}
-        />
+          <TextInput
+            style={styles.input}
+            placeholder="Type a message..."
+            placeholderTextColor="#64748b"
+            value={newMessage}
+            onChangeText={setNewMessage}
+            multiline
+            maxLength={2000}
+          />
 
-        <TouchableOpacity
-          style={[styles.sendButton, !newMessage.trim() && styles.sendButtonDisabled]}
-          onPress={sendMessage}
-          disabled={!newMessage.trim() || sending}
-        >
-          <Send size={20} color={newMessage.trim() ? '#fff' : '#64748b'} />
-        </TouchableOpacity>
-      </View>
+          {Platform.OS === 'web' && !newMessage.trim() && (
+            <TouchableOpacity style={styles.micButton} onPress={startRecording}>
+              <Mic size={20} color="#64748b" />
+            </TouchableOpacity>
+          )}
+
+          <TouchableOpacity
+            style={[styles.sendButton, !newMessage.trim() && styles.sendButtonDisabled]}
+            onPress={sendMessage}
+            disabled={!newMessage.trim() || sending}
+          >
+            <Send size={20} color={newMessage.trim() ? '#fff' : '#64748b'} />
+          </TouchableOpacity>
+        </View>
+      )}
     </KeyboardAvoidingView>
   );
 }
@@ -389,6 +611,16 @@ const styles = StyleSheet.create({
     backgroundColor: '#1e293b',
     borderBottomLeftRadius: 4,
   },
+  deletedMessage: {
+    backgroundColor: '#1e293b',
+    borderBottomLeftRadius: 4,
+    opacity: 0.5,
+  },
+  deletedText: {
+    color: '#64748b',
+    fontSize: 13,
+    fontStyle: 'italic',
+  },
   mediaBubble: {
     paddingHorizontal: 4,
     paddingVertical: 4,
@@ -420,6 +652,29 @@ const styles = StyleSheet.create({
   mediaLabel: {
     color: '#94a3b8',
     fontSize: 12,
+  },
+  audioMessage: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+    paddingVertical: 4,
+  },
+  audioWaveform: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 3,
+    flex: 1,
+  },
+  audioBar: {
+    width: 3,
+    height: 16,
+    borderRadius: 2,
+  },
+  audioBarTall: {
+    height: 24,
+  },
+  audioDuration: {
+    fontSize: 11,
   },
   messageMeta: {
     flexDirection: 'row',
@@ -478,6 +733,13 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: '#334155',
   },
+  micButton: {
+    width: 40,
+    height: 40,
+    borderRadius: 20,
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
   sendButton: {
     width: 40,
     height: 40,
@@ -488,5 +750,45 @@ const styles = StyleSheet.create({
   },
   sendButtonDisabled: {
     backgroundColor: '#1e293b',
+  },
+  recordingBar: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingHorizontal: 16,
+    paddingVertical: 12,
+    backgroundColor: '#1e293b',
+    borderTopWidth: 1,
+    borderTopColor: '#334155',
+  },
+  recordingIndicator: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+  },
+  recordingDot: {
+    width: 10,
+    height: 10,
+    borderRadius: 5,
+    backgroundColor: '#ef4444',
+  },
+  recordingText: {
+    color: '#f8fafc',
+    fontSize: 15,
+    fontWeight: '500',
+  },
+  stopButton: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    backgroundColor: '#ef4444',
+    borderRadius: 20,
+    paddingHorizontal: 16,
+    paddingVertical: 8,
+  },
+  stopButtonText: {
+    color: '#fff',
+    fontSize: 14,
+    fontWeight: '600',
   },
 });

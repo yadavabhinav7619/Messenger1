@@ -37,7 +37,7 @@ export default function ChatListScreen() {
   const [chats, setChats] = useState<ChatItem[]>([]);
   const [search, setSearch] = useState('');
   const [loading, setLoading] = useState(true);
-  const { user, profile } = useAuth();
+  const { user, profile, isAdmin } = useAuth();
   const router = useRouter();
 
   useEffect(() => {
@@ -79,7 +79,7 @@ export default function ChatListScreen() {
     }
 
     const chatItems: ChatItem[] = await Promise.all(
-      data.map(async (chat: any) => {
+      (data as any[]).map(async (chat: any) => {
         const otherId = chat.user1_id === user.id ? chat.user2_id : chat.user1_id;
 
         const { data: otherProfile } = await supabase
@@ -90,24 +90,38 @@ export default function ChatListScreen() {
 
         const { data: msgs } = await supabase
           .from('messages')
-          .select('content, message_type, created_at')
+          .select('content, message_type, created_at, is_deleted')
           .eq('chat_id', chat.id)
           .order('created_at', { ascending: false })
           .limit(1);
 
-        const { count } = await supabase
+        // Unread count: only count non-deleted, unread messages from other user
+        // Admin reads do NOT affect is_read (invisible monitoring)
+        let unreadQuery = supabase
           .from('messages')
           .select('*', { count: 'exact', head: true })
           .eq('chat_id', chat.id)
           .eq('is_read', false)
           .neq('sender_id', user.id);
 
+        // For non-admin users, exclude deleted messages from unread count
+        if (!isAdmin) {
+          unreadQuery = unreadQuery.eq('is_deleted', false);
+        }
+
+        const { count } = await unreadQuery;
+
+        // Get last non-deleted message for preview (user view)
+        const lastMsg = msgs?.[0];
+        const previewContent = lastMsg?.is_deleted ? null : lastMsg?.content;
+        const previewType = lastMsg?.is_deleted ? 'text' : lastMsg?.message_type;
+
         return {
           ...chat,
           other_user: otherProfile as ChatItem['other_user'],
-          last_message: msgs?.[0]?.content ?? '',
-          last_message_type: msgs?.[0]?.message_type ?? 'text',
-          last_message_time: msgs?.[0]?.created_at ?? chat.created_at,
+          last_message: previewContent ?? '',
+          last_message_type: previewType ?? 'text',
+          last_message_time: lastMsg?.created_at ?? chat.created_at,
           unread_count: count ?? 0,
         };
       })
@@ -199,6 +213,11 @@ export default function ChatListScreen() {
     <View style={styles.container}>
       <View style={styles.header}>
         <Text style={styles.headerTitle}>Messages</Text>
+        {isAdmin && (
+          <View style={styles.adminTag}>
+            <Text style={styles.adminTagText}>ADMIN</Text>
+          </View>
+        )}
       </View>
 
       <View style={styles.searchContainer}>
@@ -240,15 +259,29 @@ const styles = StyleSheet.create({
     backgroundColor: '#0f172a',
   },
   header: {
+    flexDirection: 'row',
+    alignItems: 'center',
     paddingHorizontal: 20,
     paddingTop: 60,
     paddingBottom: 16,
+    gap: 10,
   },
   headerTitle: {
     fontSize: 28,
     fontWeight: '700',
     color: '#f8fafc',
     letterSpacing: -0.5,
+  },
+  adminTag: {
+    backgroundColor: '#f59e0b20',
+    borderRadius: 6,
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+  },
+  adminTagText: {
+    color: '#f59e0b',
+    fontSize: 11,
+    fontWeight: '700',
   },
   searchContainer: {
     flexDirection: 'row',

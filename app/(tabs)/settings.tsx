@@ -1,9 +1,19 @@
-import { View, Text, TouchableOpacity, StyleSheet, Alert } from 'react-native';
+import { View, Text, TouchableOpacity, StyleSheet, Alert, Switch } from 'react-native';
 import { useAuth } from '@/context/auth';
-import { LogOut, User, Shield } from 'lucide-react-native';
+import { supabase } from '@/lib/supabase';
+import { LogOut, User, Shield, Bell, BellOff } from 'lucide-react-native';
 
 export default function SettingsScreen() {
   const { profile, signOut, user } = useAuth();
+
+  async function toggleNotifications() {
+    if (!user) return;
+    const newValue = !profile?.notifications_enabled;
+    await supabase
+      .from('profiles')
+      .update({ notifications_enabled: newValue })
+      .eq('id', user.id);
+  }
 
   async function handleSignOut() {
     Alert.alert('Sign Out', 'Are you sure you want to sign out?', [
@@ -74,6 +84,33 @@ export default function SettingsScreen() {
             {profile?.created_at
               ? new Date(profile.created_at).toLocaleDateString()
               : 'N/A'}
+          </Text>
+        </View>
+      </View>
+
+      <View style={styles.section}>
+        <Text style={styles.sectionTitle}>Notifications</Text>
+        <View style={styles.menuItem}>
+          <View style={styles.menuItemLeft}>
+            {profile?.notifications_enabled ? (
+              <Bell size={18} color="#0ea5e9" />
+            ) : (
+              <BellOff size={18} color="#64748b" />
+            )}
+            <Text style={styles.menuItemText}>Push Notifications</Text>
+          </View>
+          <Switch
+            value={profile?.notifications_enabled ?? true}
+            onValueChange={toggleNotifications}
+            trackColor={{ false: '#334155', true: '#0ea5e9' }}
+            thumbColor="#f8fafc"
+          />
+        </View>
+        <View style={styles.menuDivider} />
+        <View style={styles.menuItem}>
+          <Text style={styles.menuItemText}>Push Token</Text>
+          <Text style={styles.menuItemValue} numberOfLines={1}>
+            {profile?.push_token || 'Not registered'}
           </Text>
         </View>
       </View>
@@ -150,26 +187,19 @@ const styles = StyleSheet.create({
     paddingHorizontal: 10,
     paddingVertical: 6,
   },
-  adminBadgeBg: {
-    backgroundColor: '#f59e0b20',
-  },
-  userBadgeBg: {
-    backgroundColor: '#0ea5e920',
-  },
+  adminBadgeBg: { backgroundColor: '#f59e0b20' },
+  userBadgeBg: { backgroundColor: '#0ea5e920' },
   roleText: {
     fontSize: 12,
     fontWeight: '700',
   },
-  adminRoleText: {
-    color: '#f59e0b',
-  },
-  userRoleText: {
-    color: '#0ea5e9',
-  },
+  adminRoleText: { color: '#f59e0b' },
+  userRoleText: { color: '#0ea5e9' },
   section: {
     backgroundColor: '#1e293b',
     borderRadius: 16,
     marginHorizontal: 20,
+    marginBottom: 16,
     padding: 4,
   },
   sectionTitle: {
@@ -188,6 +218,11 @@ const styles = StyleSheet.create({
     paddingHorizontal: 16,
     paddingVertical: 14,
   },
+  menuItemLeft: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+  },
   menuItemText: {
     fontSize: 15,
     color: '#f8fafc',
@@ -195,6 +230,7 @@ const styles = StyleSheet.create({
   menuItemValue: {
     fontSize: 14,
     color: '#64748b',
+    maxWidth: 160,
   },
   menuDivider: {
     height: 1,
@@ -209,7 +245,7 @@ const styles = StyleSheet.create({
     backgroundColor: '#1e293b',
     borderRadius: 12,
     marginHorizontal: 20,
-    marginTop: 24,
+    marginTop: 8,
     paddingVertical: 16,
     borderWidth: 1,
     borderColor: '#ef444430',
